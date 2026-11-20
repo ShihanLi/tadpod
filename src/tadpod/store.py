@@ -117,10 +117,13 @@ def _read_export(path: Path) -> tuple[dict[str, str], date | None]:
     out: dict[str, str] = {}
     dates: list[date] = []
     if path.is_dir():
-        for p in path.rglob("*.csv"):
-            if p.name.lower() in wanted:
-                out[wanted[p.name.lower()]] = p.read_text(encoding="utf-8-sig", errors="replace")
-                dates.append(datetime.fromtimestamp(p.stat().st_mtime).date())
+        hits = [p for p in path.rglob("*.csv") if p.name.lower() in wanted]
+        folders = sorted({str(p.parent) for p in hits if p.name.lower() == "connections.csv"})
+        if len(folders) > 1:
+            raise ValueError("This folder holds several exports; pick one: " + ", ".join(folders))
+        for p in hits:
+            out[wanted[p.name.lower()]] = p.read_text(encoding="utf-8-sig", errors="replace")
+            dates.append(datetime.fromtimestamp(p.stat().st_mtime).date())
     elif zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
             for info in z.infolist():
@@ -221,7 +224,10 @@ class Store:
         p = Path(path).expanduser()
         if not p.exists():
             return {"error": f"No file or folder at {p}", "setup": SETUP}
-        files, files_date = _read_export(p)
+        try:
+            files, files_date = _read_export(p)
+        except ValueError as e:
+            return {"error": str(e)}
         if "Connections.csv" not in files:
             return {"error": f"No Connections.csv found in {p}. Is this a LinkedIn data export?", "setup": SETUP}
         digest = hashlib.sha256("\0".join(files.get(n, "") for n in EXPORT_FILES).encode()).hexdigest()

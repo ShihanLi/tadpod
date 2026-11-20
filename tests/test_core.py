@@ -161,3 +161,12 @@ def test_import_errors(store, tmp_path):
     assert "No file" in store.import_linkedin(str(tmp_path / "nope.zip"))["error"]
     (tmp_path / "empty").mkdir()
     assert "Connections.csv" in store.import_linkedin(str(tmp_path / "empty"))["error"]
+
+
+def test_folder_with_several_exports_is_rejected(store, tmp_path):
+    for d in ("2026-07-19", "2026-11-20"):
+        (tmp_path / "li" / d).mkdir(parents=True)
+        for f in FIX.iterdir():
+            (tmp_path / "li" / d / f.name).write_text(f.read_text())
+    assert "several exports" in store.import_linkedin(str(tmp_path / "li"))["error"]
+    assert store.import_linkedin(str(tmp_path / "li" / "2026-07-19"))["imported"]["connections"] == 5
