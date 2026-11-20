@@ -1,0 +1,7 @@
+CONVERSATION ID,CONVERSATION TITLE,FROM,SENDER PROFILE URL,TO,RECIPIENT PROFILE URLS,DATE,SUBJECT,CONTENT,FOLDER,ATTACHMENTS,IS MESSAGE DRAFT,IS CONVERSATION DRAFT
+c1,,Sam Ortiz,https://www.linkedin.com/in/samortiz,Test Owner,https://www.linkedin.com/in/me-test,2019-03-04 10:00:00 UTC,,"Great meeting you!
+Let's grab coffee.",INBOX,,No,No
+c1,,Test Owner,https://www.linkedin.com/in/me-test,Sam Ortiz,https://www.linkedin.com/in/samortiz,2019-03-05 10:00:00 UTC,,Sounds good,INBOX,,No,No
+c1,,Sam Ortiz,https://www.linkedin.com/in/samortiz,Test Owner,https://www.linkedin.com/in/me-test,2019-04-01 10:00:00 UTC,,See you Thursday,INBOX,,No,No
+c2,,Test Owner,https://www.linkedin.com/in/me-test,Priya Shah,https://www.linkedin.com/in/priya-shah-123,2026-11-01 10:00:00 UTC,,hey!,INBOX,,No,No
+c3,,Test Owner,https://www.linkedin.com/in/me-test,Leo Brandt,https://www.linkedin.com/in/leobrandt,2026-11-02 10:00:00 UTC,,draft text,INBOX,,Yes,No

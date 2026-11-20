@@ -1,0 +1,13 @@
+# Never commit real personal data.
+*.csv
+*.zip
+*.db
+*.db-*
+!tests/fixtures/**/*.csv
+.tadpod/
+
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
