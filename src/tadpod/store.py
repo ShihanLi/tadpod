@@ -28,9 +28,9 @@ DEFAULT_INBOX_DIRS = (
 EXPORT_FILES = ("Connections.csv", "messages.csv", "Invitations.csv")
 
 SCHEMA = """\
-people(id, slug, url, name, source, added_at)               -- everyone tadpod knows; source: linkedin | scan | chat
+people(id, slug, url, name, source, added_at)               -- everyone tadpod knows; source: linkedin | scan | manual
 context(id, person_id, date, text, noted_at)                -- dated free-form notes about a person
-scans(id, person_id, scanned_at, ingested_at, raw)          -- QR scans from the phone shortcut
+scans(id, person_id, scanned_at, ingested_at, via, raw)     -- queue entries; via: shortcut | manual
 unprocessed(scan_id, person_id, slug, url, name, scanned_at) -- view: scans with no context written since
 connections(person_id, slug, name, first_name, last_name, company, position, connected_on, email, url)
                                                             -- view: 1st-degree connections in the latest import
@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS context(
   id INTEGER PRIMARY KEY, person_id INTEGER REFERENCES people(id), date TEXT, text TEXT, noted_at TEXT);
 CREATE INDEX IF NOT EXISTS context_person ON context(person_id);
 CREATE TABLE IF NOT EXISTS scans(
-  id INTEGER PRIMARY KEY, person_id INTEGER REFERENCES people(id), scanned_at TEXT, ingested_at TEXT, raw TEXT,
-  UNIQUE(person_id, scanned_at));
+  id INTEGER PRIMARY KEY, person_id INTEGER REFERENCES people(id), scanned_at TEXT, ingested_at TEXT, via TEXT,
+  raw TEXT, UNIQUE(person_id, scanned_at));
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY, conversation_id TEXT, conversation_title TEXT, date TEXT,
   sender_name TEXT, sender_slug TEXT, from_me INTEGER, content TEXT);
@@ -147,6 +147,8 @@ class Store:
         self.db = sqlite3.connect(self.db_path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.executescript(_DDL)
+        if "via" not in {r[1] for r in self.db.execute("PRAGMA table_info(scans)")}:
+            self.db.execute("ALTER TABLE scans ADD COLUMN via TEXT")  # databases from v0.1.0
         self.db.commit()
 
     # ------------------------------------------------------------------ helpers
@@ -200,8 +202,8 @@ class Store:
                     scanned_at = utc_ts(when or datetime.fromtimestamp(p.stat().st_mtime, timezone.utc))
                     person = self._person_by_url(url) or self._create_person(url=url, source="scan")
                     cur = self.db.execute(
-                        "INSERT OR IGNORE INTO scans(person_id, scanned_at, ingested_at, raw) VALUES (?,?,?,?)",
-                        (person, scanned_at, utc_ts(), line.strip()),
+                        "INSERT OR IGNORE INTO scans(person_id, scanned_at, ingested_at, via, raw) VALUES (?,?,?,?,?)",
+                        (person, scanned_at, utc_ts(), "shortcut", line.strip()),
                     )
                     added += cur.rowcount
                 self.db.commit()
@@ -402,48 +404,101 @@ class Store:
 
     # ------------------------------------------------------------------ context
 
+    def _resolve(self, person: str) -> tuple[int | None, dict | None]:
+        """Find an existing person by id, LinkedIn URL or exact name. Returns (id, problem)."""
+        person = (person or "").strip()
+        if not person:
+            return None, {"error": "person is empty"}
+        if person.isdigit():
+            row = self.db.execute("SELECT id FROM people WHERE id = ?", (int(person),)).fetchone()
+            return (row[0], None) if row else (None, {"error": f"No person with id {person}"})
+        url_m = _ANY_URL.search(person)
+        if url_m:
+            pid = self._person_by_url(url_m.group(0))
+            return (pid, None) if pid else (None, {"not_found": True, "hint": "Add them first with add_person."})
+        matches = self._by_name(person)
+        if len(matches) > 1:
+            return None, {"ambiguous": True, "candidates": self._describe(matches),
+                          "hint": "Ask the user which one, then call again with the person id."}
+        if matches:
+            return matches[0], None
+        return None, {"not_found": True, "hint": "No one by that name. Add them first with add_person."}
+
+    def _by_name(self, name: str) -> list[int]:
+        key = norm_name(name)
+        return [i for i, n in self.db.execute("SELECT id, name FROM people WHERE name IS NOT NULL")
+                if key and norm_name(n) == key]
+
+    def _insert_context(self, pid: int, text: str, entry_date: str) -> int:
+        return self.db.execute("INSERT INTO context(person_id, date, text, noted_at) VALUES (?,?,?,?)",
+                               (pid, entry_date, text.strip(), utc_ts())).lastrowid
+
+    @staticmethod
+    def _entry_date(date_: str | None) -> tuple[str | None, dict | None]:
+        entry_date = date_ or date.today().isoformat()
+        if not parse_date(entry_date):
+            return None, {"error": f"date must be YYYY-MM-DD, got {date_!r}"}
+        return entry_date, None
+
+    def add_person(self, url: str | None = None, name: str | None = None, context: str | None = None,
+                   date_: str | None = None) -> dict:
+        """Add someone by hand. Without context they go into the unprocessed queue, like a scan."""
+        self.sync_inbox()
+        url = (url or "").strip() or None
+        name = (name or "").strip() or None
+        if url:
+            url_m = _ANY_URL.search(url)
+            if not url_m:
+                return {"error": f"Not a URL: {url!r}"}
+            url = url_m.group(0)
+        if not url and not name:
+            return {"error": "Give a LinkedIn URL, a name, or both."}
+        entry_date, problem = self._entry_date(date_)
+        if problem:
+            return problem
+
+        existing = self._person_by_url(url) if url else None
+        if not existing and not url:
+            matches = self._by_name(name)
+            if matches:
+                return {"already_exists": True, "people": self._describe(matches),
+                        "hint": "Use add_context to add notes. If this is a different person, "
+                                "call add_person again with their LinkedIn URL."}
+        if existing:
+            if name:
+                self.db.execute("UPDATE people SET name = ? WHERE id = ? AND (name IS NULL OR name = '')",
+                                (name, existing))
+            out = {"already_exists": True}
+            pid = existing
+        else:
+            pid = self._create_person(url=url, name=name, source="manual")
+            out = {"added": True}
+        if context and context.strip():
+            out["context_entry_id"] = self._insert_context(pid, context, entry_date)
+        elif not existing:
+            now = utc_ts()
+            self.db.execute("INSERT INTO scans(person_id, scanned_at, ingested_at, via, raw) VALUES (?,?,?,?,?)",
+                            (pid, now, now, "manual", None))
+            out["queued"] = True
+        self.db.commit()
+        out["person"] = self._describe([pid])[0]
+        return out
+
     def add_context(self, person: str, text: str, name: str | None = None, date_: str | None = None) -> dict:
         self.sync_inbox()
         if not (text or "").strip():
             return {"error": "text is empty"}
-        entry_date = date_ or date.today().isoformat()
-        if not parse_date(entry_date):
-            return {"error": f"date must be YYYY-MM-DD, got {date_!r}"}
-        person = (person or "").strip()
-        created = False
-        url_m = _ANY_URL.search(person)
-        if person.isdigit():
-            row = self.db.execute("SELECT id FROM people WHERE id = ?", (int(person),)).fetchone()
-            if not row:
-                return {"error": f"No person with id {person}"}
-            pid = row[0]
-        elif url_m:
-            url = url_m.group(0)
-            pid = self._person_by_url(url)
-            if pid is None:
-                pid, created = self._create_person(url=url, name=name, source="chat"), True
-        else:
-            key = norm_name(person)
-            if not key:
-                return {"error": "person is empty"}
-            matches = [(i, n) for i, n in self.db.execute("SELECT id, name FROM people WHERE name IS NOT NULL")
-                       if norm_name(n) == key]
-            if len(matches) > 1:
-                return {"ambiguous": True, "candidates": self._describe([i for i, _ in matches]),
-                        "hint": "Ask the user which one, then call again with the person id."}
-            if matches:
-                pid = matches[0][0]
-            else:
-                pid, created = self._create_person(name=name or person, source="chat"), True
+        entry_date, problem = self._entry_date(date_)
+        if problem:
+            return problem
+        pid, problem = self._resolve(person)
+        if problem:
+            return problem
         if name:
             self.db.execute("UPDATE people SET name = ? WHERE id = ? AND (name IS NULL OR name = '')", (name, pid))
-        cur = self.db.execute("INSERT INTO context(person_id, date, text, noted_at) VALUES (?,?,?,?)",
-                              (pid, entry_date, text.strip(), utc_ts()))
+        entry = self._insert_context(pid, text, entry_date)
         self.db.commit()
-        out = {"saved": True, "entry_id": cur.lastrowid, "date": entry_date, "person": self._describe([pid])[0]}
-        if created:
-            out["created_new_person"] = True
-        return out
+        return {"saved": True, "entry_id": entry, "date": entry_date, "person": self._describe([pid])[0]}
 
     def _describe(self, ids: list[int]) -> list[dict]:
         out = []

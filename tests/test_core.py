@@ -102,17 +102,38 @@ def test_add_context_resolution(store, tmp_path):
     assert by_name["person"]["company"] == "Mass General Brigham" and by_name["date"] == "2026-11-01"
     by_id = store.add_context(str(by_name["person"]["id"]), "Follow-up call")
     assert by_id["person"]["id"] == by_name["person"]["id"]
-    new = store.add_context("Tom Reed", "Runs a dairy farm in Vermont")
-    assert new["created_new_person"] is True
-    store.add_context("https://www.linkedin.com/in/tomreed-2", "Another Tom", name="Tom Reed")
+    assert store.add_context("Tom Reed", "unknown person")["not_found"] is True  # no silent creation
+    store.add_person(name="Tom Reed", context="Runs a dairy farm in Vermont")
+    store.add_person(url="https://www.linkedin.com/in/tomreed-2", name="Tom Reed", context="Another Tom")
     amb = store.add_context("Tom Reed", "which one?")
     assert amb["ambiguous"] and len(amb["candidates"]) == 2
     assert store.add_context("Sam Ortiz", "x", date_="last tuesday")["error"]
     assert rows(store, "SELECT count(*) FROM context") == [[4]]
 
 
+def test_add_person(store, tmp_path):
+    store.import_linkedin(str(make_zip(tmp_path, "x_11-20-2026.zip")))
+    # without context: queued, like a scan
+    a = store.add_person(url="https://www.linkedin.com/in/rosa-diaz?utm_source=share", name="Rosa Diaz")
+    assert a["added"] and a["queued"] and a["person"]["source"] == "manual"
+    assert rows(store, "SELECT name, via FROM unprocessed JOIN scans ON scans.id = scan_id") == [["Rosa Diaz", "manual"]]
+    # with context: saved as first entry, not queued
+    b = store.add_person(name="Lena Park", context="Met at a bakery class", date_="2026-11-15")
+    assert b["added"] and "queued" not in b
+    assert rows(store, "SELECT date, text FROM context") == [["2026-11-15", "Met at a bakery class"]]
+    # existing people are never duplicated
+    assert store.add_person(url="https://www.linkedin.com/in/samortiz")["already_exists"] is True
+    dup = store.add_person(name="sam ortiz")
+    assert dup["already_exists"] and dup["people"][0]["company"] == "Mass General Brigham"
+    assert rows(store, "SELECT count(*) FROM people") == [[7]]
+    # filling in context clears the queue
+    store.add_context("Rosa Diaz", "Runs the bakery on Elm St")
+    assert rows(store, "SELECT count(*) FROM unprocessed") == [[0]]
+    assert store.add_person()["error"] and store.add_person(url="not a url")["error"]
+
+
 def test_name_only_person_links_on_later_import(store, tmp_path):
-    store.add_context("Omar Haddad", "Met at the port tour")
+    store.add_person(name="Omar Haddad", context="Met at the port tour")
     newer = (FIX / "Connections.csv").read_text() + \
         "Omar,Haddad,https://www.linkedin.com/in/omarh,,Port of Boston,Dock Supervisor,01 Nov 2026\n"
     res = store.import_linkedin(str(make_zip(tmp_path, "x_11-20-2026.zip", newer)))

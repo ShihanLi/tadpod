@@ -1,4 +1,4 @@
-"""tadpod MCP server: import, add_context, query.
+"""tadpod MCP server: import_linkedin, add_person, add_context, query.
 
 Runs over stdio and makes no network calls. Data lives in ~/.tadpod/tadpod.db (override with
 TADPOD_HOME). Whatever a tool returns is sent to the AI app (and its model provider) that called it.
@@ -42,9 +42,18 @@ def import_linkedin(path: str) -> dict:
     return store().import_linkedin(path)
 
 
-@mcp.tool(description="""Save a dated free-form context entry about a person: how you met, what you talked about,
-anything. `person` is a LinkedIn URL, a full name, or a person id from query results. If nobody matches, a new
-person is created (say so to the user). An ambiguous name returns candidates; ask which one and retry with the id.
+@mcp.tool(description="""Add a person by hand: a LinkedIn profile URL, a name, or both. With `context`
+(free-form: how you met, anything) it's saved as their first dated entry; without it they go into the unprocessed
+queue to fill in later. If they already exist, nothing is duplicated and the match is returned. A name-only person
+is linked automatically when they appear in a later LinkedIn import. `date` (YYYY-MM-DD) defaults to today.""")
+def add_person(url: str | None = None, name: str | None = None, context: str | None = None,
+               date: str | None = None) -> dict:
+    return store().add_person(url, name, context, date)
+
+
+@mcp.tool(description="""Save a dated free-form context entry about someone already in tadpod: how you met,
+what you talked about, anything. `person` is a LinkedIn URL, a full name, or a person id from query results.
+An ambiguous name returns candidates; ask which one and retry with the id. If nobody matches, use add_person.
 `name` sets the name of a person known only by URL (e.g. a fresh scan). `date` (YYYY-MM-DD) defaults to today;
 set it when the user is describing an earlier day.""")
 def add_context(person: str, text: str, name: str | None = None, date: str | None = None) -> dict:

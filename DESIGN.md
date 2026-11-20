@@ -29,7 +29,7 @@ Cursor). They find tadpod on GitHub and install it with one config line.
 
 | Area | Decision |
 |---|---|
-| Tools | `import_linkedin`, `add_context` (creates the person if new), `query` (read-only SELECT) |
+| Tools | `import_linkedin`, `add_person` (manual add; queued if no context), `add_context` (existing people only), `query` (read-only SELECT) |
 | Context | Dated free-form entries, for anyone. `date` defaults to today; `noted_at` records when it was written. |
 | People | One row per person, keyed by LinkedIn slug when known. Name-only people are linked to a connection on import when exactly one name matches. |
 | Imports | Snapshots kept (`snapshot_connections`). Messages and invitations replaced by the newest import that includes them. |

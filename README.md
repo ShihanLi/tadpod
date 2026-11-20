@@ -38,16 +38,19 @@ Set up the "Add to tadpod" shortcut once: [docs/ios-shortcut.md](docs/ios-shortc
 Scans land in an inbox file in iCloud Drive, which tadpod pulls in automatically. When you're
 ready, tell your AI app **"process my tadpod queue."**
 
-Not on iPhone? Paste a profile link or a name into chat: "I met Jane Kim at the climbing gym,
-linkedin.com/in/janekim". Anything that appends lines to the inbox file works too
-(format below).
+## Adding people by hand
+
+Any time, on your laptop: "Add Jane Kim, linkedin.com/in/janekim, we met at the climbing gym."
+A link, a name, or both works. Add context now, or leave it for your queue. Anything that
+appends lines to the inbox file works too (format below).
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
 | `import_linkedin(path)` | Import an export zip or folder from a local path. Returns insights and, on re-imports, what changed. |
-| `add_context(person, text)` | Save a dated free-form note about someone (URL, name, or id). Creates them if new. |
+| `add_person(url, name, context)` | Add someone by hand (URL, name, or both). Without context they're queued to fill in later. |
+| `add_context(person, text)` | Save a dated free-form note about someone already in tadpod (URL, name, or id). |
 | `query(sql)` | Read-only SQL over everything: people, context, scans, the `unprocessed` queue, connections, snapshots, messages, invitations. |
 
 ## Privacy
