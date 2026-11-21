@@ -1,17 +1,18 @@
 [project]
 name = "tadpod"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Your people, on your machine. A local MCP server for your LinkedIn export, QR-scanned contacts and notes."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = ["mcp>=2.3,<3"]
+dependencies = []  # standard library only, on purpose
 
 [project.scripts]
 tadpod = "tadpod.server:main"
 
 [dependency-groups]
-dev = ["pytest>=8"]
+# mcp is only used by tests, to check compatibility with the official client.
+dev = ["pytest>=8", "mcp>=2.3,<3"]
 
 [build-system]
 requires = ["hatchling"]
@@ -19,3 +20,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tadpod"]
+
+[tool.hatch.version]
+path = "src/tadpod/__init__.py"

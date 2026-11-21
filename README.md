@@ -63,6 +63,25 @@ appends lines to the inbox file works too (format below).
   that's a problem.
 - **No LinkedIn automation.** tadpod only reads the export you download yourself.
 
+## Security
+
+- **Zero dependencies.** tadpod uses only the Python standard library, including its MCP
+  implementation (`src/tadpod/server.py`), so there's no supply chain to trust. The whole
+  codebase is short enough to read in one sitting.
+- **Read-only queries.** `query` runs on a read-only connection with an authorizer that allows
+  only `SELECT`. Queries stop after 5 seconds.
+- **Untrusted input is narrowed.** Scanned QR codes are controlled by whoever printed them, so
+  the inbox accepts only `linkedin.com/in/<slug>` links and stores them in a standard form. Other
+  lines stay in the file and are never ingested.
+- **Bounded imports.** Oversized files are refused (zip-bomb guard), folder search is shallow
+  and never follows symlinks, and the inbox skips symlinks.
+- **Owner-only database file** (`0600`).
+- **Prompt injection.** LinkedIn messages and names are written by other people. The server
+  tells the AI to treat everything it returns as data, not instructions, but treat any
+  agent with shell access accordingly.
+
+Found a vulnerability? Please open a private security advisory on GitHub rather than an issue.
+
 ## Inbox format
 
 One scan per line, in any `.txt` file in the inbox folder:

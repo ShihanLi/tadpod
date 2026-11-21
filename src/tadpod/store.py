@@ -13,10 +13,15 @@ import re
 import sqlite3
 import zipfile
 from collections import Counter
+from urllib.parse import quote
+from urllib.request import pathname2url
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from .util import iso, norm_name, parse_date, parse_datetime, parse_iso_timestamp, slug_of, slugs_in, utc_ts
+
+# LinkedIn messages can exceed csv's default 128 KB field limit.
+csv.field_size_limit(16 * 1024 * 1024)
 
 ICLOUD = Path("~/Library/Mobile Documents").expanduser()
 # The Shortcuts app's "Append to Text File" writes under iCloud Drive/Shortcuts by default;
@@ -30,7 +35,7 @@ EXPORT_FILES = ("Connections.csv", "messages.csv", "Invitations.csv")
 SCHEMA = """\
 people(id, slug, url, name, source, added_at)               -- everyone tadpod knows; source: linkedin | scan | manual
 context(id, person_id, date, text, noted_at)                -- dated free-form notes about a person
-scans(id, person_id, scanned_at, ingested_at, via, raw)     -- queue entries; via: shortcut | manual
+scans(id, person_id, scanned_at, ingested_at, via)          -- queue entries; via: shortcut | manual
 unprocessed(scan_id, person_id, slug, url, name, scanned_at) -- view: scans with no context written since
 connections(person_id, slug, name, first_name, last_name, company, position, connected_on, email, url)
                                                             -- view: 1st-degree connections in the latest import
@@ -57,7 +62,7 @@ CREATE TABLE IF NOT EXISTS context(
 CREATE INDEX IF NOT EXISTS context_person ON context(person_id);
 CREATE TABLE IF NOT EXISTS scans(
   id INTEGER PRIMARY KEY, person_id INTEGER REFERENCES people(id), scanned_at TEXT, ingested_at TEXT, via TEXT,
-  raw TEXT, UNIQUE(person_id, scanned_at));
+  UNIQUE(person_id, scanned_at));
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY, conversation_id TEXT, conversation_title TEXT, date TEXT,
   sender_name TEXT, sender_slug TEXT, from_me INTEGER, content TEXT);
@@ -92,9 +97,23 @@ EXAMPLE_QUESTIONS = [
 _READ_ACTIONS = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
 MAX_ROWS = 1000
 MAX_CELL_CHARS = 1000
+QUERY_TIMEOUT_S = 5
+MAX_EXPORT_FILE_BYTES = 200 * 1024 * 1024  # per CSV, guards against zip bombs
+MAX_INBOX_BYTES = 1024 * 1024
+MAX_FOLDER_DEPTH = 3
+_SLUG_OK = re.compile(r"^[\w.\-]{1,100}$")
 _INBOX_TS = re.compile(r"^\s*(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)")
 _ANY_URL = re.compile(r"https?://\S+")
 _EXPORT_DATE = re.compile(r"(\d{2})-(\d{2})-(\d{4})")
+
+
+def profile_url(text: str | None) -> tuple[str, str] | None:
+    """Return (slug, canonical URL) for a LinkedIn profile link, or None. Anything else is rejected:
+    inbox lines come from QR codes strangers control, and whatever we store is later read by an AI."""
+    slug = slug_of(text)
+    if not slug or not _SLUG_OK.match(slug):
+        return None
+    return slug, f"https://www.linkedin.com/in/{quote(slug)}"
 
 
 def _s(row: dict, key: str) -> str | None:
@@ -117,7 +136,17 @@ def _read_export(path: Path) -> tuple[dict[str, str], date | None]:
     out: dict[str, str] = {}
     dates: list[date] = []
     if path.is_dir():
-        hits = [p for p in path.rglob("*.csv") if p.name.lower() in wanted]
+        hits = []
+        root_depth = len(path.parts)
+        for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+            if len(Path(dirpath).parts) - root_depth >= MAX_FOLDER_DEPTH:
+                dirnames[:] = []  # don't crawl a whole disk if pointed at ~ or /
+            for f in filenames:
+                fp = Path(dirpath) / f
+                if f.lower() in wanted and not fp.is_symlink():
+                    if fp.stat().st_size > MAX_EXPORT_FILE_BYTES:
+                        raise ValueError(f"{fp} is too large to be a LinkedIn export file")
+                    hits.append(fp)
         folders = sorted({str(p.parent) for p in hits if p.name.lower() == "connections.csv"})
         if len(folders) > 1:
             raise ValueError("This folder holds several exports; pick one: " + ", ".join(folders))
@@ -129,6 +158,8 @@ def _read_export(path: Path) -> tuple[dict[str, str], date | None]:
             for info in z.infolist():
                 base = Path(info.filename).name.lower()
                 if base in wanted:
+                    if info.file_size > MAX_EXPORT_FILE_BYTES:
+                        raise ValueError(f"{info.filename} in the zip is too large to be a LinkedIn export file")
                     out[wanted[base]] = z.read(info).decode("utf-8-sig", errors="replace")
                     dates.append(date(*info.date_time[:3]))
     return out, (max(dates) if dates else None)
@@ -148,6 +179,7 @@ class Store:
             inbox_dirs = [Path(env).expanduser()] if env else list(DEFAULT_INBOX_DIRS)
         self.inbox_dirs = [Path(d) for d in inbox_dirs]
         self.db = sqlite3.connect(self.db_path, check_same_thread=False)
+        os.chmod(self.db_path, 0o600)  # owner-only, even if TADPOD_HOME is a shared folder
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.executescript(_DDL)
         if "via" not in {r[1] for r in self.db.execute("PRAGMA table_info(scans)")}:
@@ -163,16 +195,16 @@ class Store:
     def _has_import(self) -> bool:
         return self.db.execute("SELECT 1 FROM imports LIMIT 1").fetchone() is not None
 
-    def _person_by_url(self, url: str) -> int | None:
-        slug = slug_of(url)
-        row = (self.db.execute("SELECT id FROM people WHERE slug = ?", (slug,)) if slug
-               else self.db.execute("SELECT id FROM people WHERE slug IS NULL AND url = ?", (url,))).fetchone()
+    def _person_by_slug(self, slug: str) -> int | None:
+        row = self.db.execute("SELECT id FROM people WHERE slug = ?", (slug,)).fetchone()
         return row[0] if row else None
 
-    def _create_person(self, *, url: str | None = None, name: str | None = None, source: str) -> int:
+    def _create_person(self, *, profile: tuple[str, str] | None = None, name: str | None = None,
+                       source: str) -> int:
+        slug, url = profile or (None, None)
         cur = self.db.execute(
             "INSERT INTO people(slug, url, name, source, added_at) VALUES (?,?,?,?,?)",
-            (slug_of(url), url, name, source, utc_ts()),
+            (slug, url, name, source, utc_ts()),
         )
         return cur.lastrowid
 
@@ -188,27 +220,31 @@ class Store:
                 if p.name.startswith(".") and p.name.endswith(".icloud"):
                     notes.append(f"{p.name[1:-7]} is in iCloud but not downloaded to this Mac yet")
                     continue
-                if p.suffix.lower() != ".txt":
+                if p.suffix.lower() != ".txt" or p.is_symlink() or not p.is_file():
+                    continue
+                if p.stat().st_size > MAX_INBOX_BYTES:
+                    notes.append(f"{p.name} is over 1 MB; skipped. It doesn't look like a tadpod inbox file.")
                     continue
                 original = p.read_text(encoding="utf-8", errors="replace")
                 keep = []
                 for line in original.splitlines():
                     if not line.strip():
                         continue
-                    url_m = _ANY_URL.search(line)
-                    if not url_m:
-                        keep.append(line)  # never silently drop something we can't parse
+                    profile = profile_url(line)
+                    if not profile:
+                        keep.append(line)  # not a LinkedIn profile link: never ingested, never silently dropped
                         continue
-                    url = url_m.group(0).rstrip(").,;")
                     ts_m = _INBOX_TS.match(line)
                     when = parse_iso_timestamp(ts_m.group(1)) if ts_m else None
                     scanned_at = utc_ts(when or datetime.fromtimestamp(p.stat().st_mtime, timezone.utc))
-                    person = self._person_by_url(url) or self._create_person(url=url, source="scan")
+                    person = self._person_by_slug(profile[0]) or self._create_person(profile=profile, source="scan")
                     cur = self.db.execute(
-                        "INSERT OR IGNORE INTO scans(person_id, scanned_at, ingested_at, via, raw) VALUES (?,?,?,?,?)",
-                        (person, scanned_at, utc_ts(), "shortcut", line.strip()),
+                        "INSERT OR IGNORE INTO scans(person_id, scanned_at, ingested_at, via) VALUES (?,?,?,?)",
+                        (person, scanned_at, utc_ts(), "shortcut"),
                     )
                     added += cur.rowcount
+                if keep:
+                    notes.append(f"{len(keep)} line(s) in {p.name} aren't LinkedIn profile links and were left there.")
                 self.db.commit()
                 # Remove what we ingested, keeping anything appended while we were working.
                 current = p.read_text(encoding="utf-8", errors="replace")
@@ -226,7 +262,7 @@ class Store:
             return {"error": f"No file or folder at {p}", "setup": SETUP}
         try:
             files, files_date = _read_export(p)
-        except ValueError as e:
+        except (ValueError, zipfile.BadZipFile, OSError) as e:
             return {"error": str(e)}
         if "Connections.csv" not in files:
             return {"error": f"No Connections.csv found in {p}. Is this a LinkedIn data export?", "setup": SETUP}
@@ -242,6 +278,12 @@ class Store:
         export_date = export_date or iso(files_date)
 
         prev_import = self.db.execute("SELECT max(id) FROM imports WHERE connections > 0").fetchone()[0]
+        try:
+            return self._import(files, p, digest, export_date, prev_import)
+        except csv.Error as e:
+            return {"error": f"Couldn't parse the export: {e}"}
+
+    def _import(self, files: dict, p: Path, digest: str, export_date: str | None, prev_import: int | None) -> dict:
         db = self.db
         with db:
             conns = []
@@ -418,9 +460,11 @@ class Store:
         if person.isdigit():
             row = self.db.execute("SELECT id FROM people WHERE id = ?", (int(person),)).fetchone()
             return (row[0], None) if row else (None, {"error": f"No person with id {person}"})
-        url_m = _ANY_URL.search(person)
-        if url_m:
-            pid = self._person_by_url(url_m.group(0))
+        if _ANY_URL.search(person):
+            profile = profile_url(person)
+            if not profile:
+                return None, {"error": "Only LinkedIn profile links (linkedin.com/in/...) are supported."}
+            pid = self._person_by_slug(profile[0])
             return (pid, None) if pid else (None, {"not_found": True, "hint": "Add them first with add_person."})
         matches = self._by_name(person)
         if len(matches) > 1:
@@ -452,18 +496,18 @@ class Store:
         self.sync_inbox()
         url = (url or "").strip() or None
         name = (name or "").strip() or None
+        profile = None
         if url:
-            url_m = _ANY_URL.search(url)
-            if not url_m:
-                return {"error": f"Not a URL: {url!r}"}
-            url = url_m.group(0)
+            profile = profile_url(url)
+            if not profile:
+                return {"error": "url must be a LinkedIn profile link (linkedin.com/in/...)."}
         if not url and not name:
             return {"error": "Give a LinkedIn URL, a name, or both."}
         entry_date, problem = self._entry_date(date_)
         if problem:
             return problem
 
-        existing = self._person_by_url(url) if url else None
+        existing = self._person_by_slug(profile[0]) if profile else None
         if not existing and not url:
             matches = self._by_name(name)
             if matches:
@@ -477,14 +521,14 @@ class Store:
             out = {"already_exists": True}
             pid = existing
         else:
-            pid = self._create_person(url=url, name=name, source="manual")
+            pid = self._create_person(profile=profile, name=name, source="manual")
             out = {"added": True}
         if context and context.strip():
             out["context_entry_id"] = self._insert_context(pid, context, entry_date)
         elif not existing:
             now = utc_ts()
-            self.db.execute("INSERT INTO scans(person_id, scanned_at, ingested_at, via, raw) VALUES (?,?,?,?,?)",
-                            (pid, now, now, "manual", None))
+            self.db.execute("INSERT INTO scans(person_id, scanned_at, ingested_at, via) VALUES (?,?,?,?)",
+                            (pid, now, now, "manual"))
             out["queued"] = True
         self.db.commit()
         out["person"] = self._describe([pid])[0]
@@ -519,14 +563,23 @@ class Store:
 
     def query(self, sql: str, max_rows: int = 200) -> dict:
         inbox = self.sync_inbox()
-        max_rows = max(1, min(max_rows, MAX_ROWS))
-        ro = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        max_rows = max(1, min(int(max_rows), MAX_ROWS))
+        ro = sqlite3.connect(f"file:{pathname2url(str(self.db_path))}?mode=ro", uri=True)
         try:
             ro.execute("PRAGMA query_only = ON")
             ro.set_authorizer(_read_only_authorizer)
+            if hasattr(ro, "setlimit"):  # Python 3.11+: cap any single string/blob at 10 MB
+                ro.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 10 * 1024 * 1024)
+            deadline = datetime.now().timestamp() + QUERY_TIMEOUT_S
+            # A nonzero return aborts the query: stops runaway queries (e.g. unbounded recursive CTEs).
+            ro.set_progress_handler(lambda: int(datetime.now().timestamp() > deadline), 10_000)
             cur = ro.execute(sql)
             columns = [c[0] for c in cur.description or []]
             rows = cur.fetchmany(max_rows + 1)
+        except sqlite3.OperationalError as e:
+            if "interrupted" in str(e):
+                return {"error": f"Query took longer than {QUERY_TIMEOUT_S}s and was stopped. Add a LIMIT or simplify it."}
+            return {"error": str(e), "schema": SCHEMA}
         except sqlite3.Error as e:
             return {"error": str(e), "schema": SCHEMA}
         finally:
